@@ -1,0 +1,477 @@
+import streamlit as st
+import pandas as pd
+import numpy as np
+import os
+import uuid
+from datetime import datetime
+from mistralai.client import MistralClient
+from mistralai.models.chat_completion import ChatMessage
+import tempfile
+import pdfplumber
+from docx import Document
+import openpyxl
+import json
+
+# Initialize Mistral AI client
+api_key = st.secrets["MISTRAL_API_KEY"]
+model = "mistral-large-latest"
+mistral_client = MistralClient(api_key=api_key)
+
+# Define the path to CORR-DATA_Database.csv
+CORR_DATA_PATH = r"C:\Users\77ami\OneDrive\Desktop\AIMS DATA\CORR-DATA_Database.csv"
+
+# Expanded Standards databases
+NACE_STANDARDS = {
+    "Corrosion": ["MR0175", "RP0775", "SP0169", "RP0198", "TM0284", "RP0188"],
+    "Materials": ["MR0103", "MR0175", "MR0183", "MR0103"],
+    "Inspection": ["RP0102", "RP0204", "RP0502", "RP0294"],
+    "Monitoring": ["RP0189", "RP0190", "RP0492"],
+    "Cathodic Protection": ["SP0169", "RP0177", "RP0285", "RP0388"]
+}
+
+API_STANDARDS = {
+    "Design": ["API 5L", "API 6D", "API 1104", "API 5LD", "API 5CT", "API 5CRA"],
+    "Operation": ["API 570", "API 653", "API 1160", "API 1173", "API 1130"],
+    "Inspection": ["API 574", "API 578", "API 579", "API 580", "API 581"],
+    "Materials": ["API 5L", "API 5LD", "API 5CT", "API 5CRA"],
+    "Safety": ["API 754", "API 756", "API 770"]
+}
+
+ASME_STANDARDS = {
+    "Design": ["B31.4", "B31.8", "B31.3", "B31.1", "B31.12"],
+    "Materials": ["BPVC-II", "BPVC-IX", "B16.5", "B16.47"],
+    "Inspection": ["B31G", "B31.8S", "BPVC-V"]
+}
+
+ISO_STANDARDS = {
+    "Corrosion": ["ISO 21457", "ISO 15156", "ISO 15589"],
+    "Materials": ["ISO 3183", "ISO 11960", "ISO 13680"],
+    "Inspection": ["ISO 13847", "ISO 21809", "ISO 19001"]
+}
+
+# Risk matrix 5x5
+RISK_MATRIX = [
+    ["L", "L", "M", "M", "H"],
+    ["L", "M", "M", "H", "H"],
+    ["M", "M", "H", "H", "VH"],
+    ["M", "H", "H", "VH", "VH"],
+    ["H", "H", "VH", "VH", "VH"]
+]
+
+# Data storage functions
+def load_assessments():
+    """Load previous assessments from file"""
+    try:
+        if os.path.exists("assessments.json"):
+            with open("assessments.json", "r") as f:
+                return json.load(f)
+    except Exception as e:
+        st.error(f"Error loading assessments: {e}")
+    return {}
+
+def save_assessment(assessment_id, assessment_data):
+    """Save assessment to file"""
+    try:
+        assessments = load_assessments()
+        assessments[assessment_id] = assessment_data
+        
+        with open("assessments.json", "w") as f:
+            json.dump(assessments, f, indent=2)
+    except Exception as e:
+        st.error(f"Error saving assessment: {e}")
+
+# Load CORR-DATA_Database
+def load_corr_data():
+    try:
+        # Try to load from the CSV file first
+        if os.path.exists(CORR_DATA_PATH):
+            corr_data = pd.read_csv(CORR_DATA_PATH)
+            st.success("Successfully loaded CORR-DATA_Database from file")
+            return corr_data
+        
+        # Fallback to default data if CSV not found
+        corr_data = pd.DataFrame({
+            "Material": ["Carbon Steel", "Stainless Steel 316", "Duplex Steel", "Nickel Alloy", "Titanium"],
+            "Corrosion_Rate_mm_year": [0.1, 0.02, 0.05, 0.01, 0.005],
+            "Temperature_Range_C": ["-29 to 425", "-196 to 800", "-50 to 300", "-200 to 600", "-250 to 300"],
+            "Compatibility": ["Wide range", "Chloride risk", "High resistance", "Excellent resistance", "Exceptional resistance"],
+            "NACE_Standard": ["MR0175, RP0775", "MR0175, MR0103", "MR0175, MR0103", "MR0175", "MR0175"]
+        })
+        st.warning(f"Using default data as CORR-DATA_Database not found at: {CORR_DATA_PATH}")
+        return corr_data
+    except Exception as e:
+        st.error(f"Error loading CORR-DATA_Database from {CORR_DATA_PATH}: {str(e)}")
+        return pd.DataFrame()
+
+# File processing function
+def process_uploaded_file(uploaded_file):
+    file_ext = os.path.splitext(uploaded_file.name)[1].lower()
+    
+    try:
+        if file_ext == '.txt':
+            return uploaded_file.read().decode("utf-8")
+        elif file_ext == '.pdf':
+            with pdfplumber.open(uploaded_file) as pdf:
+                text = "\n".join([page.extract_text() for page in pdf.pages if page.extract_text()])
+            return text
+        elif file_ext == '.docx':
+            doc = Document(uploaded_file)
+            return "\n".join([para.text for para in doc.paragraphs if para.text])
+        elif file_ext in ('.xlsx', '.xls'):
+            df = pd.read_excel(uploaded_file)
+            return df.to_string()
+        else:
+            st.error("Unsupported file format")
+            return None
+    except Exception as e:
+        st.error(f"Error processing file: {e}")
+        return None
+
+# Risk assessment functions
+def assess_probability(material, design_cond, operation_cond, inspection_findings, corrosion_rate, wall_loss):
+    prob_score = 0
+    
+    # Material factor
+    material_factors = {
+        "carbon steel": 1.0,
+        "stainless steel 316": 0.5,
+        "duplex steel": 0.3,
+        "nickel alloy": 0.2,
+        "titanium": 0.1
+    }
+    prob_score += material_factors.get(material.lower(), 0.8)
+    
+    # Design condition factor
+    if "high" in design_cond.lower():
+        prob_score += 1.2
+    elif "moderate" in design_cond.lower():
+        prob_score += 0.6
+    
+    # Operation condition factor
+    if "harsh" in operation_cond.lower():
+        prob_score += 1.5
+    elif "moderate" in operation_cond.lower():
+        prob_score += 0.75
+    
+    # Inspection findings factor
+    if "severe" in inspection_findings.lower():
+        prob_score += 2.0
+    elif "moderate" in inspection_findings.lower():
+        prob_score += 1.0
+    
+    # Corrosion rate factor
+    if corrosion_rate > 0.5:
+        prob_score += 2.0
+    elif corrosion_rate > 0.1:
+        prob_score += 1.0
+    elif corrosion_rate > 0.05:
+        prob_score += 0.5
+    
+    # Wall loss factor
+    wall_loss_percentage = (wall_loss[0] - wall_loss[1]) / wall_loss[0] * 100
+    if wall_loss_percentage > 30:
+        prob_score += 2.0
+    elif wall_loss_percentage > 20:
+        prob_score += 1.5
+    elif wall_loss_percentage > 10:
+        prob_score += 1.0
+    
+    # Normalize to 1-5 scale
+    prob_level = min(5, max(1, int(round(prob_score / 1.5))))
+    return prob_level
+
+def assess_consequence(flow_rate, fluid_composition, location, product_flammability):
+    consequence_score = 0
+    
+    # Flow rate factor
+    if flow_rate > 20000:  # bbl/day
+        consequence_score += 2.5
+    elif flow_rate > 10000:
+        consequence_score += 2.0
+    elif flow_rate > 5000:
+        consequence_score += 1.0
+    
+    # Fluid composition factor
+    if "H2S" in fluid_composition or "sour" in fluid_composition.lower():
+        consequence_score += 2.5
+    if "CO2" in fluid_composition:
+        consequence_score += 1.0
+    if "acid" in fluid_composition.lower():
+        consequence_score += 1.5
+    
+    # Location factor
+    if "urban" in location.lower() or "populated" in location.lower():
+        consequence_score += 2.5
+    elif "environmental" in location.lower():
+        consequence_score += 2.0
+    elif "rural" in location.lower():
+        consequence_score += 1.0
+    
+    # Product flammability factor
+    if product_flammability == "Highly flammable":
+        consequence_score += 2.0
+    elif product_flammability == "Flammable":
+        consequence_score += 1.0
+    
+    # Normalize to 1-5 scale
+    consequence_level = min(5, max(1, int(round(consequence_score / 1.5))))
+    return consequence_level
+
+def get_risk_level(probability, consequence):
+    return RISK_MATRIX[probability-1][consequence-1]
+
+def get_mitigation_recommendations(input_data, risk_level):
+    prompt = f"""
+    As a pipeline risk assessment expert, provide detailed mitigation recommendations based on:
+    
+    Assessment Data:
+    {input_data}
+    
+    Risk Level: {risk_level}
+    
+    Consider these standards:
+    - NACE: {', '.join(NACE_STANDARDS['Corrosion'] + NACE_STANDARDS['Materials'])}
+    - API: {', '.join(API_STANDARDS['Design'] + API_STANDARDS['Operation'])}
+    - ASME: {', '.join(ASME_STANDARDS['Design'] + ASME_STANDARDS['Inspection'])}
+    - ISO: {', '.join(ISO_STANDARDS['Corrosion'] + ISO_STANDARDS['Materials'])}
+    
+    Provide:
+    1. Immediate actions for risk level {risk_level}
+    2. Short-term mitigation measures
+    3. Long-term prevention strategies
+    4. Recommended inspection intervals
+    5. Relevant standards for each recommendation
+    
+    Format with clear headings and bullet points.
+    """
+    
+    messages = [ChatMessage(role="user", content=prompt)]
+    response = mistral_client.chat(model=model, messages=messages)
+    return response.choices[0].message.content
+
+# Streamlit app UI
+def main():
+    st.set_page_config(page_title="Pipeline Risk Assessment AI", layout="wide")
+    
+    st.title("Oil & Gas Pipeline Risk Assessment AI Agent")
+    st.markdown("""
+    This tool assesses pipeline risk based on input parameters, stores assessments with unique IDs,
+    and provides mitigation recommendations according to industry standards.
+    """)
+    
+    # Initialize session state for assessments
+    if "assessments" not in st.session_state:
+        st.session_state.assessments = load_assessments()
+    
+    with st.sidebar:
+        st.header("Configuration")
+        
+        # File upload
+        uploaded_file = st.file_uploader("Upload Pipeline Data", 
+                                        type=["txt", "pdf", "docx", "xlsx"])
+        
+        if uploaded_file:
+            st.success(f"File uploaded: {uploaded_file.name}")
+            file_content = process_uploaded_file(uploaded_file)
+            if file_content:
+                st.text_area("File Content Preview", file_content[:1000], height=200)
+        
+        # View previous assessments
+        if st.session_state.assessments:
+            st.subheader("Previous Assessments")
+            selected_assessment = st.selectbox(
+                "Select assessment to view",
+                options=list(st.session_state.assessments.keys()),
+                format_func=lambda x: f"{x} - {st.session_state.assessments[x]['timestamp']}"
+            )
+            if selected_assessment:
+                assessment = st.session_state.assessments[selected_assessment]
+                st.json(assessment, expanded=False)
+    
+    tab1, tab2, tab3, tab4 = st.tabs(["Input Data", "Risk Assessment", "Mitigation", "Standards"])
+    
+    with tab1:
+        col1, col2 = st.columns(2)
+        
+        with col1:
+            st.subheader("Pipeline Characteristics")
+            material = st.selectbox("Material", 
+                                    ["Carbon Steel", "Stainless Steel 316", "Duplex Steel", 
+                                    "Nickel Alloy", "Titanium", "Other"])
+            design_cond = st.selectbox("Design Operating Conditions", 
+                                        ["Normal", "Moderate", "High Pressure/High Temperature",
+                                        "Cyclic Service", "Cryogenic Service"])
+            operation_cond = st.selectbox("Current Operating Conditions", 
+                                        ["Mild", "Moderate", "Harsh", "Upset Conditions"])
+            location = st.selectbox("Pipeline Location", 
+                                    ["Remote", "Environmental Sensitive", "Rural", 
+                                    "Populated Area", "Urban"])
+            product_flammability = st.selectbox("Product Flammability",
+                                            ["Non-flammable", "Flammable", "Highly flammable"])
+            
+            st.subheader("Wall Thickness (mm)")
+            col1_wt, col2_wt = st.columns(2)
+            with col1_wt:
+                original_wt = st.number_input("Original", min_value=0.1, value=10.0, step=0.1)
+            with col2_wt:
+                current_wt = st.number_input("Current", min_value=0.1, value=9.5, step=0.1)
+            
+        with col2:
+            st.subheader("Operational Data")
+            flow_rate = st.number_input("Flow Rate (bbl/day)", min_value=0, value=5000)
+            fluid_comp = st.text_area("Fluid Composition", "Crude oil with 2% H2S, 5% CO2")
+            corrosion_rate = st.number_input("Corrosion Rate (mm/year)", min_value=0.0, value=0.1, step=0.01)
+            inspection_findings = st.selectbox("Inspection Findings", 
+                                            ["No significant findings", 
+                                            "Moderate corrosion", 
+                                            "Severe corrosion/pitting",
+                                            "Cracking detected",
+                                            "Mechanical damage"])
+            
+            st.subheader("Additional Data")
+            process_file_data = st.checkbox("Include CORR-DATA_Database in analysis")
+            if process_file_data:
+                corr_data = load_corr_data()
+                if not corr_data.empty:
+                    st.dataframe(corr_data, height=200)
+    
+    with tab2:
+        if st.button("Perform Risk Assessment"):
+            with st.spinner("Assessing risk..."):
+                # Generate unique ID and timestamp
+                assessment_id = str(uuid.uuid4())
+                timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                
+                # Calculate probability and consequence
+                wall_thickness = (original_wt, current_wt)
+                prob_level = assess_probability(
+                    material, design_cond, operation_cond, 
+                    inspection_findings, corrosion_rate, wall_thickness
+                )
+                
+                consequence_level = assess_consequence(
+                    flow_rate, fluid_comp, location, product_flammability
+                )
+                
+                risk_level = get_risk_level(prob_level, consequence_level)
+                
+                # Prepare assessment data
+                assessment_data = {
+                    "id": assessment_id,
+                    "timestamp": timestamp,
+                    "material": material,
+                    "design_conditions": design_cond,
+                    "operation_conditions": operation_cond,
+                    "inspection_findings": inspection_findings,
+                    "corrosion_rate": corrosion_rate,
+                    "wall_thickness": f"{original_wt}mm original, {current_wt}mm current",
+                    "flow_rate": flow_rate,
+                    "fluid_composition": fluid_comp,
+                    "location": location,
+                    "product_flammability": product_flammability,
+                    "probability_level": prob_level,
+                    "consequence_level": consequence_level,
+                    "risk_level": risk_level,
+                    "file_uploaded": uploaded_file.name if uploaded_file else None
+                }
+                
+                # Save assessment
+                save_assessment(assessment_id, assessment_data)
+                st.session_state.assessments = load_assessments()
+                st.session_state.current_assessment = assessment_data
+                
+                # Display results
+                st.subheader(f"Risk Assessment Results [ID: {assessment_id}]")
+                
+                col1_res, col2_res = st.columns(2)
+                with col1_res:
+                    st.metric("Probability of Failure", f"Level {prob_level}")
+                    st.progress(prob_level/5)
+                    
+                with col2_res:
+                    st.metric("Consequence of Failure", f"Level {consequence_level}")
+                    st.progress(consequence_level/5)
+                
+                risk_colors = {
+                    "L": "🟢", "M": "🟡", "H": "🟠", "VH": "🔴"
+                }
+                st.markdown(f"""
+                ### Final Risk Level: {risk_colors.get(risk_level, "")} {risk_level}
+                """)
+                
+                # Show risk matrix
+                st.subheader("Risk Matrix Reference")
+                risk_df = pd.DataFrame(
+                    RISK_MATRIX,
+                    index=[f"Probability {i+1}" for i in range(5)],
+                    columns=[f"Consequence {i+1}" for i in range(5)]
+                )
+                st.dataframe(risk_df.style.applymap(
+                    lambda x: "background-color: green" if x == "L" 
+                    else "background-color: yellow" if x == "M" 
+                    else "background-color: orange" if x == "H" 
+                    else "background-color: red"
+                ))
+                
+                st.success("Risk assessment completed and saved! Proceed to Mitigation tab.")
+    
+    with tab3:
+        if "current_assessment" in st.session_state:
+            assessment = st.session_state.current_assessment
+            st.subheader(f"Mitigation Recommendations [ID: {assessment['id']}]")
+            
+            if st.button("Generate AI Recommendations"):
+                with st.spinner("Generating recommendations..."):
+                    # Format input data for AI
+                    input_data = "\n".join(
+                        [f"{k}: {v}" for k, v in assessment.items()]
+                    )
+                    
+                    recommendations = get_mitigation_recommendations(
+                        input_data, assessment["risk_level"]
+                    )
+                    
+                    # Save recommendations to assessment
+                    assessment["recommendations"] = recommendations
+                    save_assessment(assessment["id"], assessment)
+                    st.session_state.assessments = load_assessments()
+                    
+                    st.markdown(recommendations)
+        else:
+            st.warning("Please complete a risk assessment first")
+    
+    with tab4:
+        st.subheader("Industry Standards Reference")
+        
+        std_tab1, std_tab2, std_tab3, std_tab4 = st.tabs(["NACE", "API", "ASME", "ISO"])
+        
+        with std_tab1:
+            st.markdown("### NACE Standards")
+            for category, standards in NACE_STANDARDS.items():
+                with st.expander(f"{category} Standards"):
+                    for std in standards:
+                        st.markdown(f"- {std}")
+        
+        with std_tab2:
+            st.markdown("### API Standards")
+            for category, standards in API_STANDARDS.items():
+                with st.expander(f"{category} Standards"):
+                    for std in standards:
+                        st.markdown(f"- {std}")
+        
+        with std_tab3:
+            st.markdown("### ASME Standards")
+            for category, standards in ASME_STANDARDS.items():
+                with st.expander(f"{category} Standards"):
+                    for std in standards:
+                        st.markdown(f"- {std}")
+        
+        with std_tab4:
+            st.markdown("### ISO Standards")
+            for category, standards in ISO_STANDARDS.items():
+                with st.expander(f"{category} Standards"):
+                    for std in standards:
+                        st.markdown(f"- {std}")
+
+if __name__ == "__main__":
+    main()
