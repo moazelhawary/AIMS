@@ -13,6 +13,8 @@ import openpyxl
 import json
 
 # Initialize Mistral AI client
+MISTRAL_API_KEY = os.getenv("jY54sma0tUzYWwA5fRRGH5PtzfULdxm8")  # Corrected API key loading
+api_key = st.secrets[MISTRAL_API_KEY]
 api_key = st.secrets["MISTRAL_API_KEY"]
 model = "mistral-large-latest"
 mistral_client = MistralClient(api_key=api_key)
